@@ -4166,3 +4166,187 @@ mod test_auth;
 mod test_cross_contract;
 #[cfg(test)]
 mod test_namespaces;
+
+// Comprehensive unit tests for core utility functions in this file.
+// Security / safety assumptions:
+// - Tests run in a controlled test environment (`Env::default()`), where
+//   `env.mock_all_auths()` is used to bypass host auth checks when needed.
+// - These tests exercise pure logic (normalization, share math) and the
+//   minimal storage paths required to validate `set`/`get` semantics.
+// - Overflow and invalid input behaviour are asserted according to the
+//   production semantics (no panics; safe defaults/zeros returned).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        symbol_short,
+        testutils::Address as _,
+        Address,
+        Env,
+    };
+
+    #[test]
+    fn set_payment_token_decimals_bounds_and_default() {
+        let env = Env::default();
+        // Allow auth checks to pass in unit tests
+        env.mock_all_auths();
+
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let ns = symbol_short!("def");
+
+        // Register an offering so `set_payment_token_decimals` can succeed
+        assert!(RevoraRevenueShare::register_offering(
+            env.clone(),
+            issuer.clone(),
+            ns.clone(),
+            token.clone(),
+            0,
+            token.clone(),
+            0,
+        )
+        .is_ok());
+
+        // Valid bounds: 0 and 18 accepted
+        assert!(RevoraRevenueShare::set_payment_token_decimals(
+            env.clone(),
+            issuer.clone(),
+            ns.clone(),
+            token.clone(),
+            0,
+        )
+        .is_ok());
+        assert_eq!(
+            RevoraRevenueShare::get_payment_token_decimals(
+                env.clone(),
+                issuer.clone(),
+                ns.clone(),
+                token.clone()
+            ),
+            0
+        );
+
+        assert!(RevoraRevenueShare::set_payment_token_decimals(
+            env.clone(),
+            issuer.clone(),
+            ns.clone(),
+            token.clone(),
+            18,
+        )
+        .is_ok());
+        assert_eq!(
+            RevoraRevenueShare::get_payment_token_decimals(
+                env.clone(),
+                issuer.clone(),
+                ns.clone(),
+                token.clone()
+            ),
+            18
+        );
+
+        // Out-of-bounds: 19 returns LimitReached
+        let err = RevoraRevenueShare::set_payment_token_decimals(
+            env.clone(),
+            issuer.clone(),
+            ns.clone(),
+            token.clone(),
+            19,
+        )
+        .err()
+        .expect("expected error for decimals > 18");
+        assert_eq!(err, RevoraError::LimitReached);
+
+        // New offering (unset) should default to canonical precision (7)
+        let env2 = Env::default();
+        let issuer2 = Address::generate(&env2);
+        let token2 = Address::generate(&env2);
+        let ns2 = symbol_short!("x");
+        // No registration; get should return canonical precision
+        assert_eq!(
+            RevoraRevenueShare::get_payment_token_decimals(
+                env2.clone(),
+                issuer2.clone(),
+                ns2.clone(),
+                token2.clone()
+            ),
+            CANONICAL_PRECISION
+        );
+    }
+
+    #[test]
+    fn normalize_amount_scaling_and_truncation() {
+        // 6-decimal (USDC) scales up by 10
+        let amount6: i128 = 1_000_000;
+        let normalized6 = RevoraRevenueShare::normalize_amount(amount6, 6).unwrap();
+        assert_eq!(normalized6, 10_000_000);
+
+        // 7-decimal (canonical) is a no-op
+        let amount7: i128 = 10_000_000;
+        let normalized7 = RevoraRevenueShare::normalize_amount(amount7, 7).unwrap();
+        assert_eq!(normalized7, amount7);
+
+        // 8-decimal scales down by 10 with truncation
+        let amount8: i128 = 12_345_678;
+        let normalized8 = RevoraRevenueShare::normalize_amount(amount8, 8).unwrap();
+        assert_eq!(normalized8, 1_234_567);
+    }
+
+    #[test]
+    fn normalize_amount_zero_and_overflow_behavior() {
+        // Zero input should remain zero for all valid decimals
+        for d in 0..=MAX_TOKEN_DECIMALS {
+            assert_eq!(RevoraRevenueShare::normalize_amount(0, d), Some(0));
+        }
+
+        // Decimals > MAX_TOKEN_DECIMALS return None
+        assert_eq!(RevoraRevenueShare::normalize_amount(1, MAX_TOKEN_DECIMALS + 1), None);
+
+        // Overflow on scale-up returns 0 (safe failure, no panic)
+        // multiplier for decimals=0 is 10^(7-0) = 10_000_000
+        let multiplier: i128 = 10_000_000;
+        let safe_max = i128::MAX / multiplier; // multiplication won't overflow
+        let will_overflow = safe_max.saturating_add(1);
+        let result = RevoraRevenueShare::normalize_amount(will_overflow, 0);
+        assert_eq!(result, Some(0));
+    }
+
+    #[test]
+    fn compute_share_integration_with_normalize() {
+        let env = Env::default();
+
+        // 6-decimal: 1_000_000 becomes 10_000_000; 10% of that -> 1_000_000
+        let n6 = RevoraRevenueShare::normalize_amount(1_000_000, 6).unwrap();
+        let share6 = RevoraRevenueShare::compute_share(env.clone(), n6, 1_000, RoundingMode::Truncation);
+        assert_eq!(share6, 1_000_000);
+
+        // 7-decimal: unchanged -> 10_000_000; 10% -> 1_000_000
+        let n7 = RevoraRevenueShare::normalize_amount(10_000_000, 7).unwrap();
+        let share7 = RevoraRevenueShare::compute_share(env.clone(), n7, 1_000, RoundingMode::Truncation);
+        assert_eq!(share7, 1_000_000);
+
+        // 8-decimal: 12_345_678 becomes 1_234_567; 10% truncation -> 123_456
+        let n8 = RevoraRevenueShare::normalize_amount(12_345_678, 8).unwrap();
+        let share8 = RevoraRevenueShare::compute_share(env.clone(), n8, 1_000, RoundingMode::Truncation);
+        assert_eq!(share8, 123_456);
+    }
+
+    #[test]
+    fn compute_share_edge_cases() {
+        let env = Env::default();
+
+        // bps > 10000 returns 0
+        let s = RevoraRevenueShare::compute_share(env.clone(), 1_000_000, 10_001, RoundingMode::Truncation);
+        assert_eq!(s, 0);
+
+        // multiplication overflow returns 0 (safe behavior)
+        let s_over = RevoraRevenueShare::compute_share(env.clone(), i128::MAX, 10_000, RoundingMode::Truncation);
+        assert_eq!(s_over, 0);
+
+        // RoundHalfUp behavior: 1_000 * 1 bps = 0.1 -> should round to 0 for small numbers,
+        // but verify half-up rounding where applicable.
+        let amount = 15_i128; // with bps 100 -> raw = 1500 -> /10000 -> 0 with truncation
+        let trunc = RevoraRevenueShare::compute_share(env.clone(), amount, 100, RoundingMode::Truncation);
+        let half_up = RevoraRevenueShare::compute_share(env.clone(), amount, 100, RoundingMode::RoundHalfUp);
+        assert!(half_up >= trunc);
+    }
+}
