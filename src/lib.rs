@@ -185,6 +185,12 @@ const EVENT_META_REV_APPROVE: Symbol = symbol_short!("meta_rev");
 
 const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Internal canonical precision for decimal normalization.
+const CANONICAL_PRECISION: u32 = 7;
+
+/// Maximum allowed token decimals for normalization.
+const MAX_TOKEN_DECIMALS: u32 = 18;
+
 /// Represents a revenue-share offering registered on-chain.
 /// Offerings are immutable once registered.
 // ── Data structures ──────────────────────────────────────────
@@ -471,6 +477,9 @@ pub enum DataKey {
     NamespaceCount(Address),
     NamespaceItem(Address, u32),
     NamespaceRegistered(Address, Symbol),
+
+    /// Payment token decimals per offering. Defaults to 7 if unset.
+    PaymentTokenDecimals(OfferingId),
 }
 
 /// Maximum number of offerings returned in a single page.
@@ -2070,6 +2079,88 @@ impl RevoraRevenueShare {
         env.storage().persistent().get(&key).unwrap_or(0)
     }
 
+    /// Normalize an amount from token decimals to canonical 7-decimal precision.
+    ///
+    /// - 7-decimal assets → return unchanged
+    /// - 6-decimal assets → scale UP by 10 (multiply)
+    /// - 8-decimal assets → scale DOWN by 10 (divide with truncation)
+    /// - decimals outside 0..=18 return None (invalid)
+    /// - overflow during scale-up returns 0
+    pub fn normalize_amount(amount: i128, decimals: u32) -> Option<i128> {
+        // Reject decimals > 18
+        if decimals > MAX_TOKEN_DECIMALS {
+            return None;
+        }
+
+        match decimals {
+            7 => Some(amount),
+            d if d < 7 => {
+                // Scale up: multiply by 10^(7 - d)
+                // On overflow, return 0 (not None) per specification
+                let scale = 7 - d;
+                let multiplier = 10_i128.checked_pow(scale)?;
+                Some(amount.checked_mul(multiplier).unwrap_or(0))
+            }
+            d if d > 7 => {
+                // Scale down: divide by 10^(d - 7), truncating toward zero
+                let scale = d - 7;
+                amount.checked_div(10_i128.checked_pow(scale)?)
+            }
+            _ => Some(amount), // d == 7 case (already handled above)
+        }
+    }
+
+    /// Set payment token decimals for an offering. Issuer only.
+    /// Decimals must be in range 0..=18 inclusive.
+    pub fn set_payment_token_decimals(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+        decimals: u32,
+    ) -> Result<(), RevoraError> {
+        Self::require_not_frozen(&env)?;
+        let current_issuer =
+            Self::get_current_issuer(&env, issuer.clone(), namespace.clone(), token.clone())
+                .ok_or(RevoraError::OfferingNotFound)?;
+        if current_issuer != issuer {
+            return Err(RevoraError::OfferingNotFound);
+        }
+        issuer.require_auth();
+
+        if decimals > MAX_TOKEN_DECIMALS {
+            return Err(RevoraError::LimitReached);
+        }
+
+        let offering_id = OfferingId {
+            issuer: issuer.clone(),
+            namespace: namespace.clone(),
+            token: token.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PaymentTokenDecimals(offering_id), &decimals);
+        Ok(())
+    }
+
+    /// Get payment token decimals for an offering. Defaults to 7 if unset.
+    pub fn get_payment_token_decimals(
+        env: Env,
+        issuer: Address,
+        namespace: Symbol,
+        token: Address,
+    ) -> u32 {
+        let offering_id = OfferingId {
+            issuer,
+            namespace,
+            token,
+        };
+        env.storage()
+            .persistent()
+            .get(&DataKey::PaymentTokenDecimals(offering_id))
+            .unwrap_or(CANONICAL_PRECISION)
+    }
+
     /// Compute share of `amount` at `revenue_share_bps` using the given rounding mode.
     /// Guarantees: result between 0 and amount (inclusive); no loss of funds when summing shares if caller uses same mode.
     pub fn compute_share(
@@ -2082,7 +2173,10 @@ impl RevoraRevenueShare {
             return 0;
         }
         let bps = revenue_share_bps as i128;
-        let raw = amount.checked_mul(bps).unwrap_or(0);
+        let raw = match amount.checked_mul(bps) {
+            Some(v) => v,
+            None => return 0,
+        };
         let share = match mode {
             RoundingMode::Truncation => raw.checked_div(10_000).unwrap_or(0),
             RoundingMode::RoundHalfUp => {

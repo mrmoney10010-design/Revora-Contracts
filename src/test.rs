@@ -8184,5 +8184,250 @@ mod scenarios {
         let claim_res_blocked = client.try_claim(&investor, &issuer, &symbol_short!("def"), &token, &0);
         assert!(claim_res_blocked.is_err(), "Claim should fail due to blacklist");
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Payment token decimal normalization tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_amount_six_decimals_scale_up() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // 6-decimal assets should scale UP by 10
+        let amount: i128 = 1_000_000;
+        let normalized = client.normalize_amount(&amount, &6);
+        assert_eq!(normalized, Some(10_000_000)); // 1_000_000 * 10
+    }
+
+    #[test]
+    fn normalize_amount_seven_decimals_no_op() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // 7-decimal assets should return unchanged
+        let amount: i128 = 1_234_567;
+        let normalized = client.normalize_amount(&amount, &7);
+        assert_eq!(normalized, Some(1_234_567));
+    }
+
+    #[test]
+    fn normalize_amount_eight_decimals_scale_down() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // 8-decimal assets should scale DOWN by 10 with truncation
+        let amount: i128 = 12_345_678;
+        let normalized = client.normalize_amount(&amount, &8);
+        assert_eq!(normalized, Some(1_234_567)); // 12_345_678 / 10
+    }
+
+    #[test]
+    fn normalize_amount_zero_decimals() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // 0 decimals - scale UP by 10^7 (since 7-0=7)
+        let amount: i128 = 100;
+        let normalized = client.normalize_amount(&amount, &0);
+        assert_eq!(normalized, Some(1_000_000_000)); // 100 * 10^7
+    }
+
+    #[test]
+    fn normalize_amount_overflow_returns_zero() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // Normalize near i128::MAX with 0 decimals should overflow and return 0 (per spec)
+        let amount = i128::MAX;
+        let normalized = client.normalize_amount(&amount, &0);
+        // With 0 decimals, we need to multiply by 10^7 which overflows - should return 0
+        assert_eq!(normalized, Some(0));
+    }
+
+    #[test]
+    fn normalize_amount_decimals_over_18_returns_none() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // decimals > 18 should return None (invalid)
+        let amount: i128 = 1_000_000;
+        let normalized = client.normalize_amount(&amount, &19);
+        assert_eq!(normalized, None);
+    }
+
+#[test]
+    fn normalize_amount_exactly_18_decimals() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // 18 decimals - scale DOWN by 10^11 (since 18-7=11)
+        let amount: i128 = 1_000_000_000_000;
+        let normalized = client.normalize_amount(&amount, &18);
+        assert_eq!(normalized, Some(10)); // 10^12 / 10^11 = 10
+    }
+
+    #[test]
+    fn normalize_amount_truncation_behavior() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // 8 decimals with odd number should truncate
+        let amount: i128 = 12_345_679; // odd number
+        let normalized = client.normalize_amount(&amount, &8);
+        assert_eq!(normalized, Some(1_234_567)); // truncated, not rounded
+    }
+
+    #[test]
+    fn normalize_amount_negative_amount() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // Negative amounts should work correctly
+        let amount: i128 = -1_000_000;
+        let normalized = client.normalize_amount(&amount, &6);
+        assert_eq!(normalized, Some(-10_000_000));
+    }
+
+    #[test]
+    fn normalize_amount_negative_with_scale_down() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // Negative 8-decimal amount
+        let amount: i128 = -12_345_678;
+        let normalized = client.normalize_amount(&amount, &8);
+        assert_eq!(normalized, Some(-1_234_567));
+    }
+
+    #[test]
+    fn set_payment_token_decimals_stores_value() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token, &0);
+        client.set_payment_token_decimals(&issuer, &symbol_short!("def"), &token, &8);
+
+        assert_eq!(client.get_payment_token_decimals(&issuer, &symbol_short!("def"), &token), 8);
+    }
+
+    #[test]
+    fn get_payment_token_decimals_defaults_to_seven() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token, &0);
+
+        // Without setting decimals, should default to 7
+        assert_eq!(client.get_payment_token_decimals(&issuer, &symbol_short!("def"), &token), 7);
+    }
+
+    #[test]
+    fn set_payment_token_decimals_rejects_over_18() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token, &0);
+
+        let result = client.try_set_payment_token_decimals(&issuer, &symbol_short!("def"), &token, &19);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_payment_token_decimals_rejects_nonexistent_offering() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let result = client.try_set_payment_token_decimals(&issuer, &symbol_short!("def"), &token, &8);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compute_share_consistency_with_normalized_values() {
+        let env = Env::default();
+        let client = make_client(&env);
+        // Test that compute_share works correctly with values from normalize_amount
+
+        // 6-decimal: 1_000_000 becomes 10_000_000
+        let normalized_6 = client.normalize_amount(&1_000_000, &6).unwrap();
+        let share_6 = client.compute_share(&normalized_6, &1_000, &RoundingMode::Truncation); // 10%
+        assert_eq!(share_6, 1_000_000);
+
+        // 7-decimal: unchanged
+        let normalized_7 = client.normalize_amount(&10_000_000, &7).unwrap();
+        let share_7 = client.compute_share(&normalized_7, &1_000, &RoundingMode::Truncation);
+        assert_eq!(share_7, 1_000_000);
+
+        // 8-decimal: 12_345_678 becomes 1_234_567
+        let normalized_8 = client.normalize_amount(&12_345_678, &8).unwrap();
+        let share_8 = client.compute_share(&normalized_8, &1_000, &RoundingMode::Truncation);
+        assert_eq!(share_8, 123_456);
+    }
+
+    #[test]
+    fn normalize_amount_boundary_decimals() {
+        let env = Env::default();
+        let client = make_client(&env);
+
+        // Test all decimal values from 0 to 18
+        for decimals in 0..=18u32 {
+            let amount: i128 = 1_000_000;
+            let normalized = client.normalize_amount(&amount, &decimals);
+            assert!(normalized.is_some(), "decimals {} should be valid", decimals);
+        }
+    }
+
+    #[test]
+    fn normalize_amount_boundary_values() {
+        let env = Env::default();
+        let client = make_client(&env);
+
+        // Test with max safe value for 0 decimals (won't overflow)
+        // i128::MAX / 10^7 to avoid overflow when multiplying
+        let safe_max: i128 = i128::MAX / 10_000_000;
+        let normalized = client.normalize_amount(&safe_max, &0);
+        assert!(normalized.is_some());
+
+        // i128::MAX with 7 decimals should return itself
+        let normalized_max = client.normalize_amount(&i128::MAX, &7);
+        assert_eq!(normalized_max, Some(i128::MAX));
+
+        // i128::MAX with 8 decimals scales down, should work
+        let normalized_down = client.normalize_amount(&i128::MAX, &8);
+        assert!(normalized_down.is_some());
+        assert!(normalized_down.unwrap() > 0);
+    }
+
+    #[test]
+    fn normalize_amount_zero_amount() {
+        let env = Env::default();
+        let client = make_client(&env);
+
+        // Zero amount should remain zero regardless of decimals
+        for decimals in 0..=18u32 {
+            let normalized = client.normalize_amount(&0, &decimals);
+            assert_eq!(normalized, Some(0));
+        }
+    }
+
+    #[test]
+    fn set_payment_token_decimals_allows_all_valid_values() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = make_client(&env);
+        let issuer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        client.register_offering(&issuer, &symbol_short!("def"), &token, &1_000, &token, &0);
+
+        // Test all valid decimal values 0-18
+        for decimals in 0..=18u32 {
+            let result = client.try_set_payment_token_decimals(&issuer, &symbol_short!("def"), &token, &decimals);
+            assert!(result.is_ok(), "decimals {} should be accepted", decimals);
+            assert_eq!(client.get_payment_token_decimals(&issuer, &symbol_short!("def"), &token), decimals);
+        }
+    }
 }
 
